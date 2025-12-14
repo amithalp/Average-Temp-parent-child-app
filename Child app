@@ -1,0 +1,200 @@
+definition(
+    name: "Average Temperatures (Child)",
+    namespace: "hubitat",
+    parent: "hubitat:Average Temperatures (Parent)",
+    author: "Bruce Ravenel / updated",
+    description: "Average some temperature sensors (child instance)",
+    category: "Convenience",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Temperature Averager", install: true, uninstall: true) {
+        section {
+            input "thisName", "text", title: "Name this temperature averager", submitOnChange: true
+            if(thisName) app.updateLabel(thisName)
+
+            input "tempSensors", "capability.temperatureMeasurement",
+                title: "Select Temperature Sensors", submitOnChange: true, required: true, multiple: true
+
+            if(tempSensors) {
+                paragraph "Enter weight factors and offsets"
+                tempSensors.each { dev ->
+                    input "weight${dev.id}", "decimal", title: "${dev} (${dev.currentTemperature}) Weight",
+                        defaultValue: 1.0, submitOnChange: true, width: 3
+                    input "offset${dev.id}", "decimal", title: "${dev} Offset",
+                        defaultValue: 0.0, submitOnChange: true, range: "*..*", width: 3
+                }
+            }
+
+            input "useRun", "number", title: "Running average window (events):", defaultValue: 1, submitOnChange: true
+
+            section("Performance / logging") {
+                input "deltaThreshold", "decimal", title: "Only update if avg changes by at least (°):",
+                    defaultValue: 0.1, required: true
+                input "minUpdateSeconds", "number", title: "Minimum seconds between updates (0 = no throttle):",
+                    defaultValue: 0, required: true
+
+                input "inheritParentLogs", "bool", title: "Inherit log settings from parent", defaultValue: true
+                input "enableInfo", "bool", title: "Enable info logs (if not inheriting)", defaultValue: true
+                input "enableDebug", "bool", title: "Enable debug logs (if not inheriting)", defaultValue: false
+            }
+
+            if(tempSensors) {
+                def scale = location.temperatureScale
+                paragraph "Current sensor average: ${averageTemp()}°${scale}"
+                if((useRun ?: 1) > 1) {
+                    paragraph "Current running average: ${averageTemp(useRun)}°${scale}"
+                }
+            }
+        }
+    }
+}
+
+def installed() { initialize() }
+
+def updated() {
+    unsubscribe()
+    // reset running state if settings changed
+    state.remove("run")
+    state.remove("lastAvg")
+    state.remove("lastRunMs")
+    initialize()
+}
+
+def uninstalled() {
+    def dni = childDni()
+    def cd = getChildDevice(dni)
+    if(cd) {
+        try {
+            deleteChildDevice(dni)
+        } catch(e) {
+            if(infoEnabled()) log.warn "Could not delete ${cd.displayName} (${dni}). Remove it from Dashboards/Rules first. ${e.message}"
+        }
+    }
+}
+
+private String childDni() { "AverageTemp_${app.id}" }
+
+def initialize() {
+    if(!thisName) thisName = app.label
+
+    def averageDev = getChildDevice(childDni())
+    if(!averageDev) {
+        averageDev = addChildDevice(
+            "hubitat",
+            "Virtual Temperature Sensor",
+            childDni(),
+            null,
+            [label: thisName, name: thisName]
+        )
+    } else {
+        if(thisName && averageDev.label != thisName) averageDev.setLabel(thisName)
+    }
+
+    // Always subscribe so we recover automatically when sensors start reporting again
+    subscribe(tempSensors, "temperature", handler)
+
+    if((useRun ?: 1) > 1) initRun()
+
+    def avg = averageTemp(((useRun ?: 1) > 1) ? useRun : 1)
+    if(avg != null) {
+        state.lastAvg = avg
+        averageDev.setTemperature(avg)
+    } else {
+        if(debugEnabled()) log.debug "Average is null at initialize(); waiting for sensor events"
+    }
+}
+
+def initRun() {
+    def window = (useRun ?: 1) as Integer
+    if(window <= 1) return
+
+    def temp = averageTemp()
+    if(temp == null) return
+    state.run = []
+    for(int i = 0; i < window; i++) state.run += temp
+}
+
+def averageTemp(run = 1) {
+    BigDecimal total = 0
+    BigDecimal wsum  = 0
+
+    tempSensors?.each { s ->
+        def t = s.currentTemperature
+        if(t == null) return
+
+        BigDecimal offset = (settings["offset${s.id}"] != null) ? settings["offset${s.id}"] as BigDecimal : 0
+        BigDecimal w      = (settings["weight${s.id}"] != null) ? settings["weight${s.id}"] as BigDecimal : 1
+
+        total += ((t as BigDecimal) + offset) * w
+        wsum  += w
+    }
+
+    if(wsum == 0) return null
+
+    BigDecimal result = total / wsum
+
+    if((run as Integer) > 1 && state.run instanceof List && state.run.size() > 0) {
+        BigDecimal rtot = 0
+        state.run.each { rtot += (it as BigDecimal) }
+        result = rtot / (run as BigDecimal)
+    }
+
+    return (result.setScale(1, BigDecimal.ROUND_HALF_UP) as BigDecimal) as Double
+}
+
+private boolean infoEnabled() {
+    if(inheritParentLogs && parent) return (parent?.settings?.enableInfo != false)
+    return (settings.enableInfo != false)
+}
+
+private boolean debugEnabled() {
+    if(inheritParentLogs && parent) return (parent?.settings?.enableDebug == true)
+    return (settings.enableDebug == true)
+}
+
+def handler(evt) {
+    def averageDev = getChildDevice(childDni())
+    if(!averageDev) return
+
+    // optional throttle
+    def minSec = (minUpdateSeconds ?: 0) as Integer
+    if(minSec > 0) {
+        long nowMs = now()
+        long lastMs = (state.lastRunMs ?: 0L) as Long
+        if(nowMs - lastMs < (minSec * 1000L)) return
+        state.lastRunMs = nowMs
+    }
+
+    def avgInstant = averageTemp()
+	if(avgInstant == null) return
+    def avgFinal = avgInstant
+
+    def window = (useRun ?: 1) as Integer
+    if(window > 1) {
+        if(!(state.run instanceof List) || state.run.size() != window) initRun()
+        state.run = state.run.drop(1) + avgInstant
+        avgFinal = averageTemp(window)
+        if(avgFinal == null) return
+    }
+
+    BigDecimal last = (state.lastAvg != null) ? (state.lastAvg as BigDecimal) : null
+    BigDecimal thr  = (deltaThreshold != null) ? (deltaThreshold as BigDecimal) : 0.1G
+
+    if(last == null || (((avgFinal as BigDecimal) - last).abs() >= thr)) {
+        state.lastAvg = avgFinal
+        averageDev.setTemperature(avgFinal)
+        if(infoEnabled()) {
+            log.info "${averageDev.displayName} was set to ${avgFinal}°${location.temperatureScale}" +
+                     (window > 1 ? " (running avg over ${window})" : "")
+        }
+    } else {
+        if(debugEnabled()) log.debug "No significant change (${avgFinal}); skipping update"
+    }
+}
