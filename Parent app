@@ -1,0 +1,35 @@
+definition(
+    name: "Average Temperatures (Parent)",
+    namespace: "hubitat",
+    author: "Bruce Ravenel / updated",
+    description: "Create multiple temperature averagers (child instances)",
+    category: "Convenience",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Average Temperatures", install: true, uninstall: true) {
+        section("Global logging (optional)") {
+            input "enableInfo", "bool", title: "Enable info logs (for child apps that inherit)", defaultValue: true, required: false
+            input "enableDebug", "bool", title: "Enable debug logs (for child apps that inherit)", defaultValue: false, required: false
+        }
+
+        section("Averagers") {
+            app(name: "childApps",
+                appName: "Average Temperatures (Child)",
+                namespace: "hubitat",
+                title: "Add a new temperature averager",
+                multiple: true
+            )
+
+            if(childApps?.size()) {
+                paragraph "Configured averagers: ${childApps.size()}"
+            }
+        }
+    }
+}
